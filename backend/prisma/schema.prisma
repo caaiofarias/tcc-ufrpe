@@ -1,0 +1,280 @@
+// =====================================================================
+// Academic SBT — Prisma schema
+// =====================================================================
+// Architecture decisions reflected in this schema:
+//   * VC (sdJwtCompact) is NEVER persisted server-side. Reissuance is the
+//     recovery path (see Credential.reissuanceOfId).
+//   * PII lives in StudentRecord, separated from Credential to support
+//     LGPD right-to-erasure without compromising audit/integrity records.
+//   * Credentials are anchored on-chain by vcHash (SHA-256 of the
+//     issuer-signed JWT compact form). Status is mirrored in Status List.
+//   * AuditLog is append-only at the application level (no delete endpoint).
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+// INSTITUTION & USERS
+// =====================================================================
+
+model Institution {
+  id        String   @id @default(uuid())
+  name      String
+  did       String   @unique
+  domain    String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users       InstitutionUser[]
+  credentials Credential[]
+  statusLists StatusList[]
+}
+
+model InstitutionUser {
+  id            String    @id @default(uuid())
+  institutionId String
+  email         String    @unique
+  passwordHash  String // argon2id
+  role          Role
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  lastLoginAt   DateTime?
+
+  institution       Institution  @relation(fields: [institutionId], references: [id])
+  issuedCredentials Credential[] @relation("IssuedBy")
+  auditLogs         AuditLog[]
+
+  @@index([institutionId])
+}
+
+enum Role {
+  ADMIN
+  ISSUER
+}
+
+// =====================================================================
+// HOLDERS
+// =====================================================================
+// A Holder is registered by their did:ethr the first time they interact
+// with the system (typically at credential issuance time, when they present
+// their DID via QR). Address is the Ethereum address derived from did:ethr.
+// =====================================================================
+
+model Holder {
+  id         String   @id @default(uuid())
+  did        String   @unique
+  address    String   @unique
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  credentials Credential[]
+  challenges  AuthChallenge[]
+  sessions    HolderSession[]
+
+  @@index([address])
+}
+
+// Holder login uses challenge-response (sign a nonce with the DID's key).
+// Challenges are short-lived and consumed exactly once.
+model AuthChallenge {
+  id         String    @id @default(uuid())
+  holderDid  String
+  nonce      String    @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  holder Holder? @relation(fields: [holderDid], references: [did])
+
+  @@index([holderDid])
+  @@index([expiresAt])
+}
+
+// Tracks refresh tokens issued to holders. Access tokens are stateless JWTs.
+model HolderSession {
+  id           String    @id @default(uuid())
+  holderId     String
+  refreshToken String    @unique // hash of the refresh token, never raw
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  userAgent    String?
+
+  holder Holder @relation(fields: [holderId], references: [id])
+
+  @@index([holderId])
+  @@index([refreshToken])
+}
+
+// =====================================================================
+// CREDENTIALS
+// =====================================================================
+// Credential is the institutional record of an issued VC. It does NOT
+// contain the VC itself — that lives only with the holder.
+// =====================================================================
+
+model Credential {
+  id             String @id @default(uuid())
+  institutionId  String
+  holderId       String
+  issuedByUserId String
+
+  // On-chain anchor
+  sbtTokenId BigInt? @unique // null until mint confirmed
+  vcHash     String  @unique // SHA-256 of issuer-signed JWT (hex), set at creation
+  txHash     String? // null until mint confirmed
+
+  // Metadata
+  credentialType CredentialType
+  status         CredentialStatus @default(PENDING)
+
+  // Timestamps
+  issuedAt              DateTime  @default(now())
+  revokedAt             DateTime?
+  blockchainConfirmedAt DateTime?
+
+  // Reissuance link (when this credential was issued to replace another)
+  reissuanceOfId String?
+  reissuanceOf   Credential?  @relation("Reissuance", fields: [reissuanceOfId], references: [id])
+  reissuances    Credential[] @relation("Reissuance")
+
+  // Relations
+  institution   Institution     @relation(fields: [institutionId], references: [id])
+  holder        Holder          @relation(fields: [holderId], references: [id])
+  issuedBy      InstitutionUser @relation("IssuedBy", fields: [issuedByUserId], references: [id])
+  studentRecord StudentRecord?
+  revocation    Revocation?
+  statusEntry   StatusListEntry?
+
+  @@index([holderId])
+  @@index([institutionId])
+  @@index([status])
+  @@index([sbtTokenId])
+}
+
+enum CredentialStatus {
+  PENDING // tx submitted, awaiting confirmation
+  ISSUED // confirmed on-chain
+  REVOKED
+  FAILED // tx failed or reconciliation gave up
+}
+
+enum CredentialType {
+  BACHELOR
+  LICENTIATE
+  TECHNOLOGIST
+  POSTGRAD_LATO
+  POSTGRAD_STRICTO
+  SEQUENTIAL
+}
+
+// PII separated from Credential — supports LGPD right-to-erasure.
+// Erasing this record does NOT break the credential: VC remains with the
+// holder, on-chain anchor remains intact. What is lost is the institution's
+// internal record of what was issued.
+model StudentRecord {
+  id             String    @id @default(uuid())
+  credentialId   String    @unique
+  fullName       String
+  cpf            String
+  course         String
+  graduationDate DateTime
+  gpa            Decimal?  @db.Decimal(4, 2)
+  registryNumber String
+  retainUntil    DateTime?
+  erasedAt       DateTime?
+
+  credential Credential @relation(fields: [credentialId], references: [id])
+
+  @@index([cpf])
+}
+
+// =====================================================================
+// REVOCATION
+// =====================================================================
+
+model Revocation {
+  id                    String    @id @default(uuid())
+  credentialId          String    @unique
+  reason                String
+  revokedByUserId       String
+  txHash                String?
+  revokedAt             DateTime  @default(now())
+  blockchainConfirmedAt DateTime?
+
+  credential Credential @relation(fields: [credentialId], references: [id])
+
+  @@index([credentialId])
+}
+
+// Status List 2021: bitstring published as a signed VC.
+// Each issued credential takes one index; revocation flips its bit.
+model StatusList {
+  id            String   @id @default(uuid())
+  institutionId String
+  version       Int      @default(1)
+  bitstring     Bytes // gzip-compressed bitstring
+  signedVc      String // VC of the Status List, served at the public endpoint
+  publishedAt   DateTime @default(now())
+
+  institution Institution        @relation(fields: [institutionId], references: [id])
+  entries     StatusListEntry[]
+
+  @@index([institutionId])
+  @@index([publishedAt])
+}
+
+// Maps a credential to its position in the bitstring.
+model StatusListEntry {
+  id           String  @id @default(uuid())
+  statusListId String
+  credentialId String  @unique
+  index        Int
+  revoked      Boolean @default(false)
+
+  statusList StatusList @relation(fields: [statusListId], references: [id])
+  credential Credential @relation(fields: [credentialId], references: [id])
+
+  @@unique([statusListId, index])
+  @@index([credentialId])
+}
+
+// =====================================================================
+// AUDIT LOG (append-only at application level)
+// =====================================================================
+
+model AuditLog {
+  id          String      @id @default(uuid())
+  actorUserId String?
+  action      AuditAction
+  targetType  String
+  targetId    String
+  metadata    Json
+  createdAt   DateTime    @default(now())
+
+  actor InstitutionUser? @relation(fields: [actorUserId], references: [id])
+
+  @@index([targetType, targetId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+enum AuditAction {
+  CREDENTIAL_ISSUED
+  CREDENTIAL_ISSUE_FAILED
+  CREDENTIAL_REVOKED
+  CREDENTIAL_REISSUED
+  STUDENT_RECORD_ERASED
+  USER_CREATED
+  USER_LOGIN
+  USER_DEACTIVATED
+  STATUS_LIST_PUBLISHED
+}

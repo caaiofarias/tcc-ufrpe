@@ -1,0 +1,1 @@
+read instructions from project in docs/projects_summary.md
